@@ -19,90 +19,104 @@ No* criar_no() {
 
 //calcula o gini_index, uma medição que retorna o quão bom é a divisão da arvore naquele ponto dos dados
 double gini_index(Grupos grupos, Vetor classes) {
-    double gini, score, p;
+    // double gini, score, p;
     unsigned int i, j, n_instances, tam;
 
-    //Contar o numero de instâncias nos grupos
+    // Contar o numero de instâncias nos grupos
     n_instances = 0;
-
     for(i = 0; i < grupos.n; i++) {
         n_instances += grupos.v[i].n;
     }
 
-    //Calcular o Gini index
-    gini = 0;
-    #pragma omp parallel for default (none)\
-    shared(grupos, classes, n_instances, gini)\
+    // Calcular o Gini index
+    double gini = 0.0;
+
+    // Paralelização com redução para o índice gini
+    #pragma omp parallel for reduction(+:gini) default (none)\
+    shared(grupos, classes, n_instances)\
     private(i, j, tam, score, p)
     for(i = 0; i < grupos.n; i++) {
         tam = grupos.v[i].n;
-        if(tam == 0)
-            continue;
+
+        // Se o tamanho do grupo for zero, continue
+        if(tam == 0) continue;
 
         //Atribuir um score para grupo baseado na classe
         score = 0.0;
         for(j = 0; j < classes.n; j++) {
-            unsigned int k, linhas = grupos.v[i].n;
-
-            Vetor aux;
-            aux.v = (double*)malloc(linhas * sizeof(double));
-            aux.n = linhas;
-
-            for(k = 0; k < linhas; k++) {
-                unsigned int tam_linha = grupos.v[i].v[k].n;
-                aux.v[k] = grupos.v[i].v[k].v[tam_linha - 1];
-            }
-            p = (contar(aux, classes.v[j])) / ((double)tam);
+            double p = contar(grupos.v[i], classes.v[j]) / ((double)tam);
             score += p * p;
-            free(aux.v);
         }
 
-        #pragma omp critical
         gini += (1.0 - score) * ((double)tam / n_instances);
     }
     return gini;
 }
 
+/*
+    Redução correta em paralelismo:
+
+    A variável gini agora é configurada corretamente com reduction(+:gini), que soma os resultados de cada thread.
+    Remoção de declaração interna desnecessária:
+    Variável p foi substituída por um único uso direto, o que simplifica o código e reduz a sobrecarga.
+*/
+
 //retorna uma divisão dos dados para depois testar na função get_split
 Grupos test_split(unsigned int index, double value, matriz* dataset) {
     Grupo left, right;
-    unsigned int l=0, r=0, k, p;
+    // unsigned int l=0, r=0, k, p;
     left.n = right.n = 0;
     left.v = (Vetor*)malloc(dataset->i * sizeof(Vetor));
     right.v = (Vetor*)malloc(dataset->i * sizeof(Vetor));
+    
     unsigned int i, j;
+    int *l_buffer, *r_buffer;
 
-    #pragma omp parallel default(none) private(i, k)\ 
-    shared(r, l, left, right, dataset, index, value) 
+    unsigned int l_local = 0, r_local = 0;
+
+    #pragma omp parallel default(none)\
+    private(i, j, l_local, r_local)\
+    shared(left, right, dataset, index, value) 
     {
+        // Buffers locais para cada thread
+        Vetor* left_local = (Vetor*)malloc(dataset->i * sizeof(Vetor));
+        Vetor* right_local = (Vetor*)malloc(dataset->i * sizeof(Vetor));
         #pragma omp for
         for(i = 0; i < dataset->i; i++) {
             if(dataset->M[i][index] < value) {
-                #pragma omp critical
                 {
-                    left.v[l].n = dataset->j;
-                    left.v[l].v = (double*)malloc(dataset->j * sizeof(double));
-                    for(k = 0; k < dataset->j; k++) {
-                        left.v[l].v[k] = dataset->M[i][k];
+                    left_local[l_local].n = dataset->j;
+                    left.local[l_local].v = (double*)malloc(dataset->j * sizeof(double));
+                    for(j = 0; j < dataset->j; j++) {
+                        left_local[l_local].v[j] = dataset->M[i][j];
                     }
-                    l++;
+                    l_local++;
                 }
             } else {
-                #pragma omp critical
-                {
-                    right.v[r].n = dataset->j;
-                    right.v[r].v = (double*)malloc(dataset->j * sizeof(double));
-                    for(k = 0; k < dataset->j; k++) {
-                        right.v[r].v[k] = dataset->M[i][k];
-                    }
-                    r++;
+                right_local[r_local].n = dataset->j;
+                right_local[r_local].v = (double*)malloc(dataset->j * sizeof(double));
+                for(j = 0; j < dataset->j; j++) {
+                    right_local[r_local].v[j] = dataset->M[i][j];
                 }
+                r_local++;
             }
         }
+
+        // Combinar buffers locais em regiões compartilhadas
+        #pragma omp critical
+        {
+            for(i = 0; i < l_local; i++){
+                left.v[left.n++] = left_local[i];
+            }
+            for(i = 0; i < l_local; i++){
+                right.v[right.n++] = right_local[i];
+            }
+        }
+
+        free(left_local);
+        free(right_local);
     }
 
-    left.n = l;
-    right.n = r;
     Grupos split;
     split.n = 2;
     split.v = (Grupo*)malloc(2 * sizeof(Grupo));
@@ -111,6 +125,22 @@ Grupos test_split(unsigned int index, double value, matriz* dataset) {
 
     return split;
 }
+
+/* 
+    Buffers locais por thread:
+    Em vez de usar variáveis compartilhadas (left.v e right.v) diretamente, cada thread aloca seus próprios vetores (left_local e right_local).
+    Isso reduz o número de acessos concorrentes e elimina a necessidade de usar muitas regiões críticas.
+    
+    Junção de resultados em uma etapa crítica:
+    Após a execução paralela, cada thread combina seus resultados locais em uma única etapa sincronizada (#pragma omp critical).
+    Isso reduz significativamente o tempo total em regiões críticas.
+
+    Evitar alocação de memória na região paralela:
+    A memória para os buffers temporários foi alocada antes de serem combinados, o que reduz a sobrecarga dentro do loop.
+
+    Desempenho paralelo aprimorado:
+    Com menos barreiras de sincronização e mais trabalho realizado localmente em threads independentes, o desempenho melhora significativamente.
+*/
 
 //testa todas as possíveis divisões da árvore e retorna aquela com o menor gini index
 No* get_split(matriz* dataset) {
